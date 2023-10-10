@@ -1,5 +1,5 @@
-use tapstack::TunDevice;
+use tapstack::TapDevice;
 
 fn main() {
-    TunDevice::new("tap0").unwrap();
+    TapDevice::new("tap0").unwrap();
 }

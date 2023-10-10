@@ -9,13 +9,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 // ioctl_write_ptr!(tap_fd.as_raw_fd(), TUNSETIFF, &ifreq);
 
-pub struct TunDevice {
+pub struct TapDevice {
     tap_fd: OwnedFd,
 }
 
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 
-impl TunDevice {
+impl TapDevice {
     pub fn new(devname: &str) -> Result<Self, std::io::Error> {
         let tap_fd = unsafe {
             OwnedFd::from_raw_fd(nix::fcntl::open(
@@ -39,6 +39,8 @@ impl TunDevice {
         let mut ifreq = unsafe { MaybeUninit::<libc::ifreq>::zeroed().assume_init() };
 
         ifreq.ifr_name = ifr_name;
+        // IFF_TAP - TAP Device
+        // IFF_NO_PI - Don't provide packet information
         ifreq.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as i16;
 
         println!("{:#?}", ifreq.ifr_name);
