@@ -1,5 +1,6 @@
-use tapstack::TapDevice;
+use tapstack::tap::TapDevice;
 
 fn main() {
-    TapDevice::new("tap0").unwrap();
+    let dev = TapDevice::new("tap0").unwrap();
+    dev.read_packets().unwrap();
 }
