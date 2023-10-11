@@ -1,6 +1,7 @@
 use crate::arp::ArpHdr;
 use crate::eth::EthHdr;
 use crate::util;
+use crate::Tap;
 use nix::fcntl::OFlag;
 use nix::libc;
 use nix::sys::{
@@ -11,14 +12,17 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);
+ioctl_read_bad!(siocgifhwaddr, libc::SIOCGIFHWADDR, libc::ifreq);
 
 pub struct TapDevice {
     devname: String,
+    ip: u32,
+    mac: [u8; 6],
     tap_fd: OwnedFd,
 }
 
 impl TapDevice {
-    pub fn new(devname: &str) -> Result<Self, std::io::Error> {
+    pub fn new(devname: &str, ip: &SockaddrIn) -> Result<Self, std::io::Error> {
         let tap_fd = unsafe {
             OwnedFd::from_raw_fd(nix::fcntl::open(
                 "/dev/net/tun",
@@ -36,13 +40,17 @@ impl TapDevice {
             tunsetiff(tap_fd.as_raw_fd(), &ifreq as *const _ as u64)?;
         }
 
+        Self::set_ip_addr(devname, ip)?;
+
         Ok(Self {
             devname: String::from(devname),
+            ip: ip.ip(),
+            mac: Self::get_mac_addr(devname)?,
             tap_fd,
         })
     }
 
-    pub fn set_ip_addr(&self, sockaddr: &SockaddrIn) -> Result<(), std::io::Error> {
+    fn set_ip_addr(devname: &str, sockaddr: &SockaddrIn) -> Result<(), std::io::Error> {
         let sockfd = nix::sys::socket::socket(
             AddressFamily::Inet,
             SockType::Datagram,
@@ -50,7 +58,7 @@ impl TapDevice {
             None,
         )?;
 
-        let mut ifreq = util::create_ifreq(self.devname.as_str(), 0);
+        let mut ifreq = util::create_ifreq(devname, 0);
 
         unsafe {
             ifreq.ifr_ifru.ifru_addr = *sockaddr.as_ptr();
@@ -58,6 +66,32 @@ impl TapDevice {
         }
 
         Ok(())
+    }
+
+    fn get_mac_addr(devname: &str) -> Result<[u8; 6], std::io::Error> {
+        let sockfd = nix::sys::socket::socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )?;
+
+        let mut ifreq = util::create_ifreq(devname, 0);
+
+        unsafe {
+            siocgifhwaddr(sockfd.as_raw_fd(), &mut ifreq)?;
+        }
+
+        let mut mac = [0_u8; 6];
+
+        for (left, right) in mac[..]
+            .iter_mut()
+            .zip(unsafe { ifreq.ifr_ifru.ifru_hwaddr.sa_data })
+        {
+            *left = right as u8;
+        }
+
+        Ok(mac)
     }
 
     pub fn read_packets(&self) -> Result<(), std::io::Error> {
@@ -72,7 +106,18 @@ impl TapDevice {
             if eth_hdr.eth_type >= 1536 {
                 match eth_hdr.eth_type as i32 {
                     libc::ETH_P_ARP => {
-                        println!("Got ARP request! {:#?}", ArpHdr::new(&buf[14..]));
+                        let arp_hdr = ArpHdr::new(&buf[14..]);
+
+                        println!("Got ARP request! {:#?}", arp_hdr);
+
+                        let bytes = arp_hdr.to_reply_bytes(self);
+                        println!(
+                            "Constructed Ethernet Frame {:#?}\nARP Frame {:#?}",
+                            EthHdr::new(&bytes[..]),
+                            ArpHdr::new(&bytes[14..])
+                        );
+
+                        nix::unistd::write(self.tap_fd.as_raw_fd(), &bytes)?;
                     }
                     libc::ETH_P_IPV6 => {
                         println!("Got IPv6 request!");
@@ -85,5 +130,15 @@ impl TapDevice {
                 println!("Got payload with length: {}", eth_hdr.eth_type);
             }
         }
+    }
+}
+
+impl Tap for TapDevice {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn ip(&self) -> u32 {
+        self.ip
     }
 }

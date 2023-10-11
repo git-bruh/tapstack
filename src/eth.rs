@@ -22,6 +22,17 @@ impl EthHdr {
 
         hdr
     }
+
+    pub fn to_reply_bytes(&self) -> Vec<u8> {
+        let mut out_be_bytes = Vec::<u8>::new();
+        out_be_bytes.reserve(14);
+
+        out_be_bytes.extend(self.dest_mac);
+        out_be_bytes.extend(self.source_mac);
+        out_be_bytes.extend(self.eth_type.to_be_bytes());
+
+        out_be_bytes
+    }
 }
 
 impl fmt::Debug for EthHdr {
