@@ -18,8 +18,7 @@ impl EthHdr {
 
         hdr.dest_mac.copy_from_slice(&bytes[0..6]);
         hdr.source_mac.copy_from_slice(&bytes[6..12]);
-        // Convert individual bits to a 16 bit integer
-        hdr.eth_type = ((bytes[12] as u16) << 8) + (bytes[13] as u16);
+        hdr.eth_type = util::unpack_u16(&bytes[12..14]);
 
         hdr
     }
