@@ -1,5 +1,6 @@
 use crate::arp::ArpHdr;
 use crate::eth::EthHdr;
+use crate::ip::IpHdr;
 use crate::util;
 use crate::Tap;
 use nix::fcntl::OFlag;
@@ -9,7 +10,6 @@ use nix::sys::{
     stat::Mode,
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);
 ioctl_read_bad!(siocgifhwaddr, libc::SIOCGIFHWADDR, libc::ifreq);
@@ -118,6 +118,11 @@ impl TapDevice {
                         );
 
                         nix::unistd::write(self.tap_fd.as_raw_fd(), &bytes)?;
+                    }
+                    libc::ETH_P_IP => {
+                        let ip_hdr = IpHdr::new(&buf[14..]);
+
+                        println!("Got IP packet! {:#?}", ip_hdr);
                     }
                     libc::ETH_P_IPV6 => {
                         println!("Got IPv6 request!");
