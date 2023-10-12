@@ -22,7 +22,7 @@ pub struct IpHdr {
 
 impl IpHdr {
     pub fn new(bytes: &[u8]) -> Self {
-        IpHdr {
+        let hdr = IpHdr {
             // Convert to_be() rather than to_le() as to_le() is a no-op
             // on little endian since rust assumes that the original value
             // was in LE
@@ -36,7 +36,35 @@ impl IpHdr {
             hdr_cksum: util::unpack_u16(&bytes[10..12]),
             src_addr: util::unpack_u32(&bytes[12..16]),
             dst_addr: util::unpack_u32(&bytes[16..20]),
+        };
+
+        assert_eq!(Self::cksum(&bytes[..(hdr.ihl() * 4) as usize]), 0);
+        hdr
+    }
+
+    /// Compute and verify the checksum
+    fn cksum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+
+        for (idx, byte) in bytes.iter().enumerate() {
+            let byte = *byte as u32;
+
+            // TODO unroll rather than this hack
+            // > sum += * (unsigned short) addr++;
+            // We must treat individual bytes in such a way that
+            // every 2nd byte completes a 16 bit integer value
+            if idx % 2 == 0 {
+                sum += byte;
+            } else {
+                sum += byte << 8;
+            }
         }
+
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+
+        (!sum as u16)
     }
 
     /// The first 4 bits contain the number
