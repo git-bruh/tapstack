@@ -3,6 +3,7 @@ extern crate nix;
 
 pub mod arp;
 pub mod eth;
+pub mod icmp;
 pub mod ip;
 pub mod tap;
 pub mod util;

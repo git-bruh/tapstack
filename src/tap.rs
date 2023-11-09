@@ -1,15 +1,14 @@
-use crate::arp::ArpHdr;
-use crate::eth::EthHdr;
-use crate::ip::IpHdr;
-use crate::util;
-use crate::Tap;
-use nix::fcntl::OFlag;
-use nix::libc;
-use nix::sys::{
-    socket::{AddressFamily, SockFlag, SockType, SockaddrIn, SockaddrLike},
-    stat::Mode,
+use crate::{arp::ArpHdr, eth::EthHdr, icmp::IcmpHdr, ip::IpHdr, util, Tap};
+use nix::{
+    fcntl::OFlag,
+    libc,
+    sys::{
+        socket::{AddressFamily, SockFlag, SockType, SockaddrIn, SockaddrLike},
+        stat::Mode,
+    },
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);
 ioctl_read_bad!(siocgifhwaddr, libc::SIOCGIFHWADDR, libc::ifreq);
@@ -106,7 +105,7 @@ impl TapDevice {
             if eth_hdr.eth_type >= 1536 {
                 match eth_hdr.eth_type as i32 {
                     libc::ETH_P_ARP => {
-                        let arp_hdr = ArpHdr::new(&buf[14..]);
+                        let arp_hdr = ArpHdr::new(&buf[14..size]);
 
                         println!("Got ARP request! {:#?}", arp_hdr);
 
@@ -114,15 +113,24 @@ impl TapDevice {
                         println!(
                             "Constructed Ethernet Frame {:#?}\nARP Frame {:#?}",
                             EthHdr::new(&bytes[..]),
-                            ArpHdr::new(&bytes[14..])
+                            ArpHdr::new(&bytes[14..size])
                         );
 
                         nix::unistd::write(self.tap_fd.as_raw_fd(), &bytes)?;
                     }
                     libc::ETH_P_IP => {
-                        let ip_hdr = IpHdr::new(&buf[14..]);
+                        let ip_hdr = IpHdr::new(&buf[14..size]);
 
                         println!("Got IP packet! {:#?}", ip_hdr);
+
+                        match ip_hdr.proto {
+                            IpHdr::PROTO_ICMP => {
+                                println!("ICMP! {:#?}", IcmpHdr::new(&buf[34..size]));
+                            }
+                            IpHdr::PROTO_TCP => {}
+                            IpHdr::PROTO_UDP => {}
+                            _ => panic!("Unimplemented protocol {}", ip_hdr.proto),
+                        }
                     }
                     libc::ETH_P_IPV6 => {
                         println!("Got IPv6 request!");

@@ -21,6 +21,10 @@ pub struct IpHdr {
 }
 
 impl IpHdr {
+    pub const PROTO_ICMP: u8 = 0x01;
+    pub const PROTO_TCP: u8 = 0x06;
+    pub const PROTO_UDP: u8 = 0x11;
+
     pub fn new(bytes: &[u8]) -> Self {
         let hdr = IpHdr {
             // Convert to_be() rather than to_le() as to_le() is a no-op
