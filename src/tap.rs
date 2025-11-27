@@ -1,4 +1,4 @@
-use crate::util;
+use crate::{util, tcp};
 use nix::{
     fcntl::OFlag,
     libc,
@@ -8,29 +8,28 @@ use nix::{
     },
 };
 use std::{
-    sync::{mpsc, mpsc::{Sender, Receiver}},
+    sync::{mpsc, Mutex},
+    collections::HashMap,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    net::{SocketAddrV4, Ipv4Addr},
 };
 
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);
 ioctl_read_bad!(siocgifhwaddr, libc::SIOCGIFHWADDR, libc::ifreq);
 
-pub struct TcpPacket {
-    pub header: etherparse::TcpHeader,
-    pub payload: Vec<u8>,
-}
-
 pub struct TapDevice {
     pub devname: String,
     pub ip: [u8; 4],
     pub mac: [u8; 6],
-    tx: Sender<TcpPacket>,
     tap_fd: OwnedFd,
+    quad_to_socket: Mutex<HashMap<(SocketAddrV4, SocketAddrV4), tcp::TcpSocket>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl TapDevice {
-    pub fn new(devname: &str) -> Result<(Self, Receiver<TcpPacket>), std::io::Error> {
+    pub fn new(devname: &str) -> Result<Self, std::io::Error> {
         let tap_fd = unsafe {
             OwnedFd::from_raw_fd(nix::fcntl::open(
                 "/dev/net/tun",
@@ -77,13 +76,15 @@ impl TapDevice {
 
         let (tx, rx) = mpsc::channel();
 
-        Ok((Self {
+        Ok(Self {
             devname: String::from(devname),
             ip: [10, 0, 0, 1],
             mac: Self::get_mac_addr(devname)?,
+            quad_to_socket: Mutex::new(HashMap::new()),
             tap_fd,
+            rx,
             tx,
-        }, rx))
+        })
     }
 
     fn _set_ip_addr(devname: &str, sockaddr: &SockaddrIn) -> Result<(), std::io::Error> {
@@ -139,11 +140,12 @@ impl TapDevice {
                     etherparse::IpNumber::TCP => {
                         match etherparse::TcpSlice::from_slice(&buf[ip.slice().len()..size]) {
                             Ok(tcp) => {
-                                println!("Got TCP packet: {tcp:?}");
-                                self.tx.send(TcpPacket {
-                                    header: tcp.to_header(),
-                                    payload: tcp.payload().to_vec(),
-                                }).unwrap();
+                                let quad = (SocketAddrV4::new(ip.destination_addr(), tcp.destination_port()), SocketAddrV4::new(ip.source_addr(), tcp.source_port()));
+                                if let Some(socket) = self.quad_to_socket.lock().unwrap().get_mut(&quad) {
+                                    socket.on_packet(tcp);
+                                } else {
+                                    eprintln!("Received TCP packet for unknown quad: {quad:?}");
+                                }
                             }
                             Err(e) => eprintln!("Invalid TCP packet received: {e}"),
                         }
@@ -161,7 +163,33 @@ impl TapDevice {
         }
     }
 
-    pub fn write_packet(&self, data: &[u8]) -> Result<(), std::io::Error> {
+    pub fn connect(&self, remote_addr: SocketAddrV4) -> Result<TcpSocket, std::io::Error> {
+        let [a, b, c, d] = self.ip;
+        let mut local_addr = SocketAddrV4::new(
+            Ipv4Addr::new(a, b, c, d),
+            rand::random_range(10000..=65535),
+        );
+
+        let mut quad_to_socket = self.quad_to_socket.lock().unwrap();
+
+        'a: loop {
+            for quad in quad_to_socket.keys() {
+                if quad.0.port() == local_addr.port() {
+                    local_addr.set_port(local_addr.port() + 1);
+                    continue 'a;
+                }
+            }
+
+            break;
+        }
+
+        quad_to_socket.insert((local_addr, remote_addr), tcp::TcpSocket::new(local_addr, remote_addr, self.tx.clone()));
+        quad_to_socket.get_mut(&(local_addr, remote_addr)).unwrap().connect();
+
+        Ok(())
+    }
+
+    fn write_packet(&self, data: &[u8]) -> Result<(), std::io::Error> {
         nix::unistd::write(self.tap_fd.as_raw_fd(), data)?;
         Ok(())
     }
