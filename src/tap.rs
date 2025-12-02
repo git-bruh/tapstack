@@ -8,7 +8,7 @@ use nix::{
     },
 };
 use std::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, Arc},
     collections::HashMap,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     net::{SocketAddrV4, Ipv4Addr},
@@ -23,7 +23,7 @@ pub struct TapDevice {
     pub ip: [u8; 4],
     pub mac: [u8; 6],
     tap_fd: OwnedFd,
-    quad_to_socket: Mutex<HashMap<(SocketAddrV4, SocketAddrV4), tcp::TcpSocket>>,
+    quad_to_socket: Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Arc<Mutex<tcp::TcpSocket>>>>,
     rx: mpsc::Receiver<Vec<u8>>,
     tx: mpsc::Sender<Vec<u8>>,
 }
@@ -142,7 +142,7 @@ impl TapDevice {
                             Ok(tcp) => {
                                 let quad = (SocketAddrV4::new(ip.destination_addr(), tcp.destination_port()), SocketAddrV4::new(ip.source_addr(), tcp.source_port()));
                                 if let Some(socket) = self.quad_to_socket.lock().unwrap().get_mut(&quad) {
-                                    socket.on_packet(tcp);
+                                    socket.lock().unwrap().on_packet(tcp);
                                 } else {
                                     eprintln!("Received TCP packet for unknown quad: {quad:?}");
                                 }
@@ -163,7 +163,13 @@ impl TapDevice {
         }
     }
 
-    pub fn connect(&self, remote_addr: SocketAddrV4) -> Result<TcpSocket, std::io::Error> {
+    pub fn write_packets(&self) -> Result<(), std::io::Error> {
+        loop {
+            nix::unistd::write(self.tap_fd.as_raw_fd(), &self.rx.recv().unwrap())?;
+        }
+    }
+
+    pub fn connect(&self, remote_addr: SocketAddrV4) -> Result<tcp::TcpSocketWrapper, std::io::Error> {
         let [a, b, c, d] = self.ip;
         let mut local_addr = SocketAddrV4::new(
             Ipv4Addr::new(a, b, c, d),
@@ -183,14 +189,15 @@ impl TapDevice {
             break;
         }
 
-        quad_to_socket.insert((local_addr, remote_addr), tcp::TcpSocket::new(local_addr, remote_addr, self.tx.clone()));
-        quad_to_socket.get_mut(&(local_addr, remote_addr)).unwrap().connect();
+        let socket = tcp::TcpSocket::new(local_addr, remote_addr, self.tx.clone());
+        let condvar = socket.state_condvar();
+        let socket = Arc::new(Mutex::new(socket));
+        quad_to_socket.insert((local_addr, remote_addr), socket.clone());
+        drop(quad_to_socket);
 
-        Ok(())
-    }
+        let socket = tcp::TcpSocketWrapper::new(socket, condvar);
+        socket.connect();
 
-    fn write_packet(&self, data: &[u8]) -> Result<(), std::io::Error> {
-        nix::unistd::write(self.tap_fd.as_raw_fd(), data)?;
-        Ok(())
+        Ok(socket)
     }
 }

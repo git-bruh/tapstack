@@ -1,36 +1,26 @@
 use tapstack::tap::TapDevice;
-use tapstack::tcp::TcpSocket;
-use std::sync::Arc;
+use std::{net::{SocketAddrV4, Ipv4Addr}, sync::Arc};
 
 fn main() {
-    let (dev, rx) = TapDevice::new("tap0").unwrap();
-    let dev = Arc::new(dev);
+    let dev = Arc::new(TapDevice::new("tap0").unwrap());
 
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    let handle = {
+    let reader_handle = {
         let dev = Arc::clone(&dev);
         std::thread::spawn(move || dev.read_packets().unwrap())
     };
 
-    let (mut socket, payload) = TcpSocket::new(dev.ip, [45, 79, 112, 203], 1234, 4242);
-    dev.write_packet(&payload).expect("failed to write packet");
+    let writer_handle = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || dev.write_packets().unwrap())
+    };
 
-    let mut estab = false;
-    loop {
-        match socket.handle_packet(rx.recv().unwrap()) {
-            Ok(payload) => if let Some(payload) = payload { dev.write_packet(&payload).expect("failed to write packet") },
-            Err(e) => {
-                eprintln!("Failed to handle incoming TCP packet: {e:?}");
-                break;
-            },
-        }
+    let socket = dev.connect(SocketAddrV4::new(Ipv4Addr::new(45, 79, 112, 203), 4242)).unwrap();
+    socket.write(b"hello");
+    let response = socket.read();
+    eprintln!("{response:?}");
 
-        if !estab {
-            estab = true;
-            dev.write_packet(&socket.send(b"hello")).expect("failed to write packet");
-        }
-    }
-
-    handle.join().expect("failed to join thread");
+    reader_handle.join().expect("failed to join thread");
+    writer_handle.join().expect("failed to join thread");
 }

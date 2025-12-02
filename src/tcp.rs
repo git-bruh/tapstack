@@ -1,4 +1,4 @@
-use std::{sync::mpsc, net::SocketAddrV4};
+use std::{sync::{Arc, mpsc, Mutex, Condvar}, collections::HashMap, net::SocketAddrV4};
 
 #[derive(Debug)]
 pub enum TcpError {
@@ -28,7 +28,40 @@ pub struct TcpSocket {
     send_next: u32,
     window: Vec<u8>,
     state: TcpState,
+    state_condvar: Arc<Condvar>,
     tx: mpsc::Sender<Vec<u8>>,
+}
+
+pub struct TcpSocketWrapper {
+    socket: Arc<Mutex<TcpSocket>>,
+    state_condvar: Arc<Condvar>,
+}
+
+impl TcpSocketWrapper {
+    pub fn new(socket: Arc<Mutex<TcpSocket>>, state_condvar: Arc<Condvar>) -> Self {
+        Self {
+            socket,
+            state_condvar,
+        }
+    }
+
+    pub fn connect(&self) {
+        let mut socket = self.socket.lock().unwrap();
+        socket.connect();
+
+        while !matches!(socket.state, TcpState::Established) {
+            socket = self.state_condvar.wait(socket).unwrap();
+        }
+    }
+
+    pub fn write(&self, data: &[u8]) {
+        self.socket.lock().unwrap().write(data)
+    }
+
+    pub fn read(&self) -> Vec<u8> {
+        let mut socket = self.socket.lock().unwrap();
+        Vec::new()
+    }
 }
 
 impl TcpSocket {
@@ -59,10 +92,16 @@ impl TcpSocket {
                 options: etherparse::TcpOptions::default(),
             },
             state: TcpState::Listen,
+            state_condvar: Arc::new(Condvar::new()),
             tx,
         }
     }
 
+    pub fn state_condvar(&self) -> Arc<Condvar> {
+        Arc::clone(&self.state_condvar)
+    }
+
+    // TODO make non-mut
     pub fn connect(&mut self) {
         self.header.syn = true;
         self.state = TcpState::SynSent;
