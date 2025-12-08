@@ -11,16 +11,10 @@ fn main() {
         std::thread::spawn(move || dev.read_packets().unwrap())
     };
 
-    let writer_handle = {
-        let dev = Arc::clone(&dev);
-        std::thread::spawn(move || dev.write_packets().unwrap())
-    };
-
     let socket = dev.connect(SocketAddrV4::new(Ipv4Addr::new(45, 79, 112, 203), 4242)).unwrap();
-    socket.write(b"hello");
+    socket.write(b"hello\n");
     let response = socket.read();
-    eprintln!("{response:?}");
+    eprintln!("Response {response:?}");
 
     reader_handle.join().expect("failed to join thread");
-    writer_handle.join().expect("failed to join thread");
 }

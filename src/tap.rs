@@ -24,8 +24,8 @@ pub struct TapDevice {
     pub mac: [u8; 6],
     tap_fd: OwnedFd,
     quad_to_socket: Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Arc<Mutex<tcp::TcpSocket>>>>,
-    rx: mpsc::Receiver<Vec<u8>>,
     tx: mpsc::Sender<Vec<u8>>,
+    writer_jh: std::thread::JoinHandle<()>,
 }
 
 impl TapDevice {
@@ -74,7 +74,12 @@ impl TapDevice {
             .spawn()?
             .wait()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
+
+        let raw_fd = tap_fd.as_raw_fd();
+        let writer_jh = std::thread::spawn(move || loop {
+            nix::unistd::write(raw_fd, &rx.recv().unwrap()).unwrap();
+        });
 
         Ok(Self {
             devname: String::from(devname),
@@ -82,8 +87,8 @@ impl TapDevice {
             mac: Self::get_mac_addr(devname)?,
             quad_to_socket: Mutex::new(HashMap::new()),
             tap_fd,
-            rx,
             tx,
+            writer_jh,
         })
     }
 
@@ -160,12 +165,6 @@ impl TapDevice {
                 },
                 Err(e) => eprintln!("Invalid IP packet received: {e}"),
             }
-        }
-    }
-
-    pub fn write_packets(&self) -> Result<(), std::io::Error> {
-        loop {
-            nix::unistd::write(self.tap_fd.as_raw_fd(), &self.rx.recv().unwrap())?;
         }
     }
 
