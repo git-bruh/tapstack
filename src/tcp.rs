@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddrV4,
     sync::{mpsc, Arc, Condvar, Mutex},
+    io::{Read, Write},
 };
 
 #[derive(Debug)]
@@ -31,7 +32,8 @@ pub struct TcpSocket {
     send_unack: u32,
     send_next: u32,
     recv_next: u32,
-    window: Vec<u8>,
+    send_window: Vec<u8>,
+    recv_window: Vec<u8>,
     state: TcpState,
     state_condvar: Arc<Condvar>,
     tx: mpsc::Sender<Vec<u8>>,
@@ -58,14 +60,42 @@ impl TcpSocketWrapper {
             socket = self.state_condvar.wait(socket).unwrap();
         }
     }
+}
 
-    pub fn write(&self, data: &[u8]) {
-        self.socket.lock().unwrap().write(data)
+impl Write for TcpSocketWrapper {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut n = 0;
+        let mut socket = self.socket.lock().unwrap();
+
+        loop {
+            socket.error_for_state_write()?;
+            n += socket.write(&buf[n..]);
+            if n == buf.len() {
+                return Ok(n);
+            }
+
+            socket = self.state_condvar.wait(socket).unwrap();
+        }
     }
 
-    pub fn read(&self) -> Vec<u8> {
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Read for TcpSocketWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut socket = self.socket.lock().unwrap();
-        Vec::new()
+
+        loop {
+            socket.error_for_state_read()?;
+            let size = socket.read(buf);
+            if size > 0 {
+                return Ok(size);
+            }
+
+            socket = self.state_condvar.wait(socket).unwrap();
+        }
     }
 }
 
@@ -83,7 +113,8 @@ impl TcpSocket {
             send_unack: sequence_number,
             send_next: sequence_number + 1,
             recv_next: 0,
-            window: Vec::new(),
+            send_window: Vec::new(),
+            recv_window: Vec::new(),
             header: etherparse::TcpHeader {
                 source_port: source_addr.port(),
                 destination_port: destination_addr.port(),
@@ -125,9 +156,23 @@ impl TcpSocket {
         self.state_condvar.notify_all();
     }
 
+    fn error_for_state_read(&self) -> Result<(), std::io::Error> {
+        match self.state {
+            TcpState::Established => Ok(()),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "can't read")),
+        }
+    }
+
+    fn error_for_state_write(&self) -> Result<(), std::io::Error> {
+        match self.state {
+            TcpState::Established => Ok(()),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "can't write")),
+        }
+    }
+
     pub fn on_packet(&mut self, pkt: etherparse::TcpSlice) {
-        eprintln!("SND.UNA: {}, SND.NXT: {}", self.send_unack, self.send_next);
-        eprintln!("{:#?}", pkt);
+        eprintln!("SND.UNA: {}, SND.NXT: {} RCV.NXT: {}", self.send_unack, self.send_next, self.recv_next);
+        eprintln!("{:?}", pkt);
 
         match self.state {
             TcpState::SynSent => {
@@ -156,7 +201,7 @@ impl TcpSocket {
                 }
 
                 if pkt.syn() {
-                    self.recv_next = pkt.sequence_number() + 1;
+                    self.recv_next = pkt.sequence_number().wrapping_add(1);
                     self.send_unack = pkt.acknowledgment_number();
 
                     self.header.sequence_number = self.send_next;
@@ -165,8 +210,8 @@ impl TcpSocket {
                     self.header.ack = true;
 
                     self.header.window_size = pkt.window_size();
-                    self.window.reserve_exact(self.header.window_size as usize);
-                    self.window.resize(self.header.window_size as usize, 0);
+                    self.send_window.reserve_exact(self.header.window_size as usize);
+                    self.send_window.resize(self.header.window_size as usize, 0);
 
                     self.set_state(TcpState::Established);
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
@@ -200,14 +245,23 @@ impl TcpSocket {
                     return;
                 }
 
-                if pkt.acknowledgment_number() <= self.send_unack
-                    || pkt.acknowledgment_number() > self.send_next
-                {
-                    eprintln!("invalid acknowledgement number received");
-                    return;
+                if pkt.acknowledgment_number() > self.send_unack && pkt.acknowledgment_number() <= self.send_next {
+                    self.send_unack = pkt.acknowledgment_number();
                 }
 
-                self.send_unack = pkt.acknowledgment_number();
+                // TODO update SND.WND
+
+                // TODO delayed ACK
+                if !pkt.payload().is_empty() {
+                    self.recv_window.extend_from_slice(pkt.payload());
+                    self.recv_next = self.recv_next.wrapping_add(pkt.payload().len() as u32);
+                    let mut header = self.header.clone();
+                    header.sequence_number = self.send_next;
+                    header.acknowledgment_number = self.recv_next;
+                    self.transmit_payload(header, &[]).unwrap();
+                }
+
+                self.state_condvar.notify_all();
             }
             TcpState::Closed => {
                 if !pkt.rst() {
@@ -229,17 +283,23 @@ impl TcpSocket {
         };
     }
 
-    pub fn write(&mut self, payload: &[u8]) {
-        self.header.psh = true;
-        self.header.sequence_number = self.send_next;
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        if self.recv_window.is_empty() {
+            0
+        } else {
+            let drained = self.recv_window.drain(0..buf.len().min(self.recv_window.len()));
+            buf[0..drained.len()].copy_from_slice(drained.as_slice());
+            drained.len()
+        }
+    }
 
+    pub fn write(&mut self, payload: &[u8]) -> usize {
         // window size = 2
         // SND.UNA = 2
         // SND.NXT = 4
         //  1    2    3    4
         // ----|----|----|----|
-        // try to push 2 more bytes
-        let len = self.window.len();
+        let len = self.send_window.len();
         let begin = self.send_unack as usize % len;
         let end = self.send_next as usize % len;
 
@@ -248,15 +308,22 @@ impl TcpSocket {
         } else {
             begin - end
         };
-        for idx in 0..available_capacity {
-            self.window[(end + idx) % len] = payload[idx];
+
+        if available_capacity > 0 {
+            for idx in 0..available_capacity {
+                self.send_window[(end + idx) % len] = payload[idx];
+            }
+
+            self.header.sequence_number = self.send_next;
+            let mut header = self.header.clone();
+            header.psh = true;
+            self.send_next = self.send_next.wrapping_add(available_capacity as u32);
+
+            self.transmit_payload(header, &payload[0..available_capacity])
+                .unwrap();
         }
 
-        self.send_next += available_capacity as u32;
-
-        self.transmit_payload(self.header.clone(), &payload[0..available_capacity])
-            .unwrap();
-        self.header.psh = false;
+        available_capacity
     }
 
     fn transmit_payload(
