@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     net::SocketAddrV4,
     sync::{mpsc, Arc, Condvar, Mutex},
     io::{Read, Write},
@@ -34,9 +34,13 @@ pub struct TcpSocket {
     recv_next: u32,
     send_window: Vec<u8>,
     recv_window: Vec<u8>,
+    srtt: f64,
+    rttvar: f64,
+    rto: f64,
     state: TcpState,
     state_condvar: Arc<Condvar>,
     tx: mpsc::Sender<Vec<u8>>,
+    timers: BTreeMap<u32, std::time::Instant>,
 }
 
 pub struct TcpSocketWrapper {
@@ -113,6 +117,9 @@ impl TcpSocket {
             send_unack: sequence_number,
             send_next: sequence_number + 1,
             recv_next: 0,
+            srtt: 0.0,
+            rttvar: 0.0,
+            rto: 0.0,
             send_window: Vec::new(),
             recv_window: Vec::new(),
             header: etherparse::TcpHeader {
@@ -137,6 +144,7 @@ impl TcpSocket {
             state: TcpState::Listen,
             state_condvar: Arc::new(Condvar::new()),
             tx,
+            timers: BTreeMap::new(),
         }
     }
 
@@ -168,6 +176,22 @@ impl TcpSocket {
             TcpState::Established => Ok(()),
             _ => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "can't write")),
         }
+    }
+
+    // RFC 6298
+    fn on_rtt_measurement(&mut self, r: std::time::Duration) {
+        if self.srtt == 0.0 {
+            self.srtt = r.as_secs_f64();
+            self.rttvar = self.srtt / 2.0;
+        } else {
+            self.rttvar = (0.75 * self.rttvar) + (0.25 * (self.srtt - r.as_secs_f64()).abs());
+            self.srtt = (0.875 * self.srtt) + (0.125 * r.as_secs_f64());
+        }
+
+        self.rto = (self.srtt + (4.0 * self.rttvar).max(0.01)).max(1.0);
+    }
+
+    pub fn tick(&mut self) {
     }
 
     pub fn on_packet(&mut self, pkt: etherparse::TcpSlice) {
@@ -314,6 +338,8 @@ impl TcpSocket {
                 self.send_window[(end + idx) % len] = payload[idx];
             }
 
+            self.timers.insert(self.send_next, std::time::Instant::now());
+
             self.header.sequence_number = self.send_next;
             let mut header = self.header.clone();
             header.psh = true;
@@ -331,6 +357,7 @@ impl TcpSocket {
         header: etherparse::TcpHeader,
         payload: &[u8],
     ) -> Result<(), mpsc::SendError<Vec<u8>>> {
+        eprintln!("SENT {:?}", header);
         let tcp = etherparse::PacketBuilder::ipv4(self.source_ip, self.destination_ip, 64)
             .tcp_header(header);
         let mut result = Vec::with_capacity(tcp.size(0));

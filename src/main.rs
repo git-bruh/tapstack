@@ -19,7 +19,7 @@ fn main() {
         let n = socket.read(&mut buf).unwrap();
         eprintln!("=== Response {}", std::str::from_utf8(&buf[0..n]).unwrap());
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_secs(100));
     }
 
     reader_handle.join().expect("failed to join thread");
