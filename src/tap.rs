@@ -139,6 +139,14 @@ impl TapDevice {
     pub fn read_packets(&self) -> Result<(), std::io::Error> {
         loop {
             let mut buf = vec![0_u8; 65536];
+            // TODO if there is a constant stream of data coming then this might
+            // not fire very frequently, add logic to compute duration from last tick
+            // and fire tick() accordingly
+            if nix::poll::poll(&mut [nix::poll::PollFd::new(&self.tap_fd, nix::poll::PollFlags::POLLIN)], 10)? == 0 {
+                self.quad_to_socket.lock().unwrap().values().for_each(|socket| socket.lock().unwrap().tick());
+                continue;
+            }
+
             let size = nix::unistd::read(self.tap_fd.as_raw_fd(), &mut buf[..])?;
             match etherparse::Ipv4HeaderSlice::from_slice(&buf) {
                 Ok(ip) => match ip.protocol() {
