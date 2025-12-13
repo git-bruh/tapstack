@@ -2,6 +2,8 @@ use tapstack::tap::TapDevice;
 use std::{net::{SocketAddrV4, Ipv4Addr}, io::{Read, Write}, sync::Arc};
 
 fn main() {
+    stderrlog::new().verbosity(log::Level::Trace).module(module_path!()).init().unwrap();
+
     let dev = Arc::new(TapDevice::new("tap0").unwrap());
 
     std::thread::sleep(std::time::Duration::from_secs(5));
