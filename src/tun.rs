@@ -1,4 +1,5 @@
-use crate::{util, tcp};
+use crate::{tcp, util};
+use log::*;
 use nix::{
     fcntl::OFlag,
     libc,
@@ -8,17 +9,17 @@ use nix::{
     },
 };
 use std::{
-    sync::{mpsc, Mutex, Arc},
     collections::HashMap,
+    net::{Ipv4Addr, SocketAddrV4},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    net::{SocketAddrV4, Ipv4Addr},
+    sync::{mpsc, Arc, Mutex},
 };
 
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);
 ioctl_read_bad!(siocgifhwaddr, libc::SIOCGIFHWADDR, libc::ifreq);
 
-pub struct TapDevice {
+pub struct TunDevice {
     pub devname: String,
     pub ip: [u8; 4],
     pub mac: [u8; 6],
@@ -28,7 +29,7 @@ pub struct TapDevice {
     writer_jh: std::thread::JoinHandle<()>,
 }
 
-impl TapDevice {
+impl TunDevice {
     pub fn new(devname: &str) -> Result<Self, std::io::Error> {
         let tap_fd = unsafe {
             OwnedFd::from_raw_fd(nix::fcntl::open(
@@ -142,8 +143,19 @@ impl TapDevice {
             // TODO if there is a constant stream of data coming then this might
             // not fire very frequently, add logic to compute duration from last tick
             // and fire tick() accordingly
-            if nix::poll::poll(&mut [nix::poll::PollFd::new(&self.tap_fd, nix::poll::PollFlags::POLLIN)], 10)? == 0 {
-                self.quad_to_socket.lock().unwrap().values().for_each(|socket| socket.lock().unwrap().tick());
+            if nix::poll::poll(
+                &mut [nix::poll::PollFd::new(
+                    &self.tap_fd,
+                    nix::poll::PollFlags::POLLIN,
+                )],
+                10,
+            )? == 0
+            {
+                self.quad_to_socket
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .for_each(|socket| socket.lock().unwrap().tick());
                 continue;
             }
 
@@ -153,35 +165,44 @@ impl TapDevice {
                     etherparse::IpNumber::TCP => {
                         match etherparse::TcpSlice::from_slice(&buf[ip.slice().len()..size]) {
                             Ok(tcp) => {
-                                let quad = (SocketAddrV4::new(ip.destination_addr(), tcp.destination_port()), SocketAddrV4::new(ip.source_addr(), tcp.source_port()));
-                                if let Some(socket) = self.quad_to_socket.lock().unwrap().get_mut(&quad) {
+                                let quad = (
+                                    SocketAddrV4::new(
+                                        ip.destination_addr(),
+                                        tcp.destination_port(),
+                                    ),
+                                    SocketAddrV4::new(ip.source_addr(), tcp.source_port()),
+                                );
+                                if let Some(socket) =
+                                    self.quad_to_socket.lock().unwrap().get_mut(&quad)
+                                {
                                     socket.lock().unwrap().on_packet(tcp);
                                 } else {
-                                    eprintln!("Received TCP packet for unknown quad: {quad:?}");
+                                    warn!("Received TCP packet for unknown quad: {quad:?}");
                                 }
                             }
-                            Err(e) => eprintln!("Invalid TCP packet received: {e}"),
+                            Err(e) => error!("Invalid TCP packet received: {e}"),
                         }
                     }
                     etherparse::IpNumber::ICMP => {
                         match etherparse::Icmpv4Slice::from_slice(&buf[ip.slice().len()..size]) {
-                            Ok(icmp) => println!("Got ICMP packet: {:?}", icmp.icmp_type()),
-                            Err(e) => eprintln!("Invalid ICMP packet received: {e}"),
+                            Ok(icmp) => info!("Got ICMP packet: {:?}", icmp.icmp_type()),
+                            Err(e) => error!("Invalid ICMP packet received: {e}"),
                         }
                     }
-                    protocol => eprintln!("Unknown IP protocol: {protocol:?}"),
+                    protocol => error!("Unknown IP protocol: {protocol:?}"),
                 },
-                Err(e) => eprintln!("Invalid IP packet received: {e}"),
+                Err(e) => error!("Invalid IP packet received: {e}"),
             }
         }
     }
 
-    pub fn connect(&self, remote_addr: SocketAddrV4) -> Result<tcp::TcpSocketWrapper, std::io::Error> {
+    pub fn connect(
+        &self,
+        remote_addr: SocketAddrV4,
+    ) -> Result<tcp::TcpSocketWrapper, std::io::Error> {
         let [a, b, c, d] = self.ip;
-        let mut local_addr = SocketAddrV4::new(
-            Ipv4Addr::new(a, b, c, d),
-            rand::random_range(10000..=65535),
-        );
+        let mut local_addr =
+            SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), rand::random_range(10000..=65535));
 
         let mut quad_to_socket = self.quad_to_socket.lock().unwrap();
 

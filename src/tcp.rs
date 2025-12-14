@@ -54,7 +54,7 @@ pub struct TcpSocket {
     state_condvar: Arc<Condvar>,
     tx: mpsc::Sender<Vec<u8>>,
     partial_segments: BTreeMap<u32, Vec<u8>>,
-    timers: BTreeMap<u32, std::time::Instant>,
+    timers: BTreeMap<u32, (bool, std::time::Instant)>,
 }
 
 pub struct TcpSocketWrapper {
@@ -170,7 +170,8 @@ impl TcpSocket {
     pub fn connect(&mut self) {
         self.header.syn = true;
         self.state = TcpState::SynSent;
-        self.timers.insert(self.syn_seq, std::time::Instant::now());
+        self.timers
+            .insert(self.syn_seq, (false, std::time::Instant::now()));
         self.transmit_payload(self.header.clone(), &[]).unwrap();
     }
 
@@ -188,13 +189,25 @@ impl TcpSocket {
     }
 
     fn set_state(&mut self, ctx: &Context, state: TcpState) {
-        info!(ctx:serde = ctx; "transitioned from {:?} to {:?}", self.state, state);
+        info!(ctx:serde = ctx; "transitioned to {:?}", state);
         self.state = state;
         self.state_condvar.notify_all();
     }
 
     // RFC 6298
-    fn on_rtt_measurement(&mut self, r: std::time::Duration) {
+    fn on_rtt_measurement(&mut self, ctx: &Context, ack: u32) {
+        let r = if let Some((retransmitted, instant)) = self.timers.get(&ack) {
+            if *retransmitted {
+                debug!(ctx:serde = ctx, ack; "segment was retransmitted, not measuring RTT");
+                return;
+            }
+
+            std::time::Instant::now().duration_since(*instant)
+        } else {
+            error!(ctx:serde = ctx, ack; "segment did not exist in retransmission queue");
+            return;
+        };
+
         // reset the measurements if RTO was multiplied for retransmission
         if self.srtt == 0.0 || self.rto > (self.srtt + (4.0 * self.rttvar).max(0.01)).max(1.0) {
             self.srtt = r.as_secs_f64();
@@ -208,16 +221,21 @@ impl TcpSocket {
     }
 
     pub fn tick(&mut self) {
+        let ctx = self.get_context(None);
+
         self.timers.retain(|seq, _| *seq >= self.send_unack);
         if let Some(mut entry) = self.timers.first_entry() {
-            let (seq, instant) = (entry.key().clone(), entry.get_mut());
+            let (seq, (retransmitted, instant)) = (entry.key().clone(), entry.get_mut());
             if std::time::Instant::now()
                 .duration_since(*instant)
                 .as_secs_f64()
                 >= self.rto
             {
+                debug!(ctx:serde = ctx, seq, rto = self.rto, retransmitted = *retransmitted; "retransmitting segment");
+
                 *instant = std::time::Instant::now();
-                self.rto = (self.rto * 2.0).max(60.0);
+                *retransmitted = true;
+                self.rto = (self.rto * 2.0).min(60.0);
 
                 if seq == self.syn_seq {
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
@@ -256,6 +274,8 @@ impl TcpSocket {
         } else if let TcpState::FinWait1 = self.state {
             // all queues are clear, we can close
             if self.fin_seq.is_none() {
+                info!(ctx:serde = ctx; "all pending segments retransmitted, sending FIN");
+
                 self.header.fin = true;
                 self.header.sequence_number = self.send_next;
                 self.fin_seq = Some(self.header.sequence_number);
@@ -300,6 +320,8 @@ impl TcpSocket {
                 }
 
                 if pkt.syn() {
+                    info!(ctx:serde = ctx; "received SYN-ACK");
+
                     self.recv_next = pkt.sequence_number().wrapping_add(1);
                     self.send_unack = pkt.acknowledgment_number();
 
@@ -312,6 +334,8 @@ impl TcpSocket {
                     self.send_window
                         .reserve_exact(self.header.window_size as usize);
                     self.send_window.resize(self.header.window_size as usize, 0);
+
+                    self.on_rtt_measurement(&ctx, pkt.acknowledgment_number());
 
                     self.set_state(&ctx, TcpState::Established);
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
@@ -376,6 +400,7 @@ impl TcpSocket {
                 if self.send_unack < pkt.acknowledgment_number()
                     && pkt.acknowledgment_number() <= self.send_next
                 {
+                    self.on_rtt_measurement(&ctx, pkt.acknowledgment_number());
                     debug!(ctx:serde = ctx; "advancing SND.UNA");
                     self.send_unack = pkt.acknowledgment_number();
                 }
@@ -548,7 +573,7 @@ impl TcpSocket {
             }
 
             self.timers
-                .insert(self.send_next, std::time::Instant::now());
+                .insert(self.send_next, (false, std::time::Instant::now()));
 
             self.header.sequence_number = self.send_next;
             let mut header = self.header.clone();
@@ -587,7 +612,6 @@ impl TcpSocket {
         header: etherparse::TcpHeader,
         payload: &[u8],
     ) -> Result<(), mpsc::SendError<Vec<u8>>> {
-        eprintln!("SENT {:?}", header);
         let tcp = etherparse::PacketBuilder::ipv4(self.source_ip, self.destination_ip, 64)
             .tcp_header(header);
         let mut result = Vec::with_capacity(tcp.size(0));
