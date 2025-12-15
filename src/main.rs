@@ -4,13 +4,11 @@ use std::{
     sync::Arc,
 };
 use tapstack::tun::TunDevice;
+use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 
 fn main() {
-    stderrlog::new()
-        .verbosity(log::Level::Trace)
-        .module(module_path!())
-        .init()
-        .unwrap();
+    let subscriber = Registry::default().with(fmt::layer().with_writer(std::io::stderr));
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let dev = Arc::new(TunDevice::new("tun0").unwrap());
 

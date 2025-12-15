@@ -1,5 +1,4 @@
 use crate::{tcp, util};
-use log::*;
 use nix::{
     fcntl::OFlag,
     libc,
@@ -14,6 +13,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{mpsc, Arc, Mutex},
 };
+use tracing::{error, info, warn};
 
 ioctl_write_int!(tunsetiff, b'T' as u8, 202 as u32);
 ioctl_write_ptr_bad!(siocsifaddr, libc::SIOCSIFADDR, libc::ifreq);

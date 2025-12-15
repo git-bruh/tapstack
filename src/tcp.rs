@@ -1,13 +1,12 @@
-use log::*;
-use serde::Serialize;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::SocketAddrV4,
     sync::{mpsc, Arc, Condvar, Mutex},
 };
+use tracing::{debug, error, info, warn};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 enum TcpState {
     Listen,
     SynSent,
@@ -22,18 +21,10 @@ enum TcpState {
     Closed,
 }
 
-#[derive(Serialize)]
-struct Context {
-    state: TcpState,
-    rto: f64,
-    seq: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rseq: Option<u32>,
-    snd_una: u32,
-    snd_nxt: u32,
-    rcv_nxt: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fin_seq: Option<u32>,
+impl std::fmt::Display for TcpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 pub struct TcpSocket {
@@ -175,36 +166,39 @@ impl TcpSocket {
         self.transmit_payload(self.header.clone(), &[]).unwrap();
     }
 
-    fn get_context(&self, rseq: Option<u32>) -> Context {
-        Context {
-            state: self.state.clone(),
-            rto: self.rto,
-            seq: self.header.sequence_number,
+    fn get_span(&self, rseq: Option<u32>) -> tracing::span::Span {
+        tracing::span!(
+            tracing::Level::TRACE,
+            "socket",
+            state = self.state.to_string(),
+            rto = self.rto,
+            seq = self.header.sequence_number,
             rseq,
-            snd_una: self.send_unack,
-            snd_nxt: self.send_next,
-            rcv_nxt: self.recv_next,
-            fin_seq: self.fin_seq,
-        }
+            snd.una = self.send_unack,
+            snd.nxt = self.send_next,
+            rcv.nxt = self.recv_next,
+            fin_seq = self.fin_seq
+        )
     }
 
-    fn set_state(&mut self, ctx: &Context, state: TcpState) {
-        info!(ctx:serde = ctx; "transitioned to {:?}", state);
+    fn set_state(&mut self, state: TcpState) {
+        info!("transitioned to {state:?}");
+
         self.state = state;
         self.state_condvar.notify_all();
     }
 
     // RFC 6298
-    fn on_rtt_measurement(&mut self, ctx: &Context, ack: u32) {
+    fn on_rtt_measurement(&mut self, ack: u32) {
         let r = if let Some((retransmitted, instant)) = self.timers.get(&ack) {
             if *retransmitted {
-                debug!(ctx:serde = ctx, ack; "segment was retransmitted, not measuring RTT");
+                debug!(ack, "segment was retransmitted, not measuring RTT");
                 return;
             }
 
             std::time::Instant::now().duration_since(*instant)
         } else {
-            error!(ctx:serde = ctx, ack; "segment did not exist in retransmission queue");
+            error!(ack, "segment did not exist in retransmission queue");
             return;
         };
 
@@ -221,7 +215,8 @@ impl TcpSocket {
     }
 
     pub fn tick(&mut self) {
-        let ctx = self.get_context(None);
+        let span = self.get_span(None);
+        let _enter = span.enter();
 
         self.timers.retain(|seq, _| *seq >= self.send_unack);
         if let Some(mut entry) = self.timers.first_entry() {
@@ -231,7 +226,11 @@ impl TcpSocket {
                 .as_secs_f64()
                 >= self.rto
             {
-                debug!(ctx:serde = ctx, seq, rto = self.rto, retransmitted = *retransmitted; "retransmitting segment");
+                debug!(
+                    seq,
+                    retransmitted = *retransmitted,
+                    "retransmitting segment"
+                );
 
                 *instant = std::time::Instant::now();
                 *retransmitted = true;
@@ -274,7 +273,7 @@ impl TcpSocket {
         } else if let TcpState::FinWait1 = self.state {
             // all queues are clear, we can close
             if self.fin_seq.is_none() {
-                info!(ctx:serde = ctx; "all pending segments retransmitted, sending FIN");
+                info!("all pending segments retransmitted, sending FIN");
 
                 self.header.fin = true;
                 self.header.sequence_number = self.send_next;
@@ -285,27 +284,28 @@ impl TcpSocket {
     }
 
     pub fn on_packet(&mut self, pkt: etherparse::TcpSlice) {
-        let ctx = self.get_context(Some(pkt.sequence_number()));
+        let span = self.get_span(Some(pkt.sequence_number()));
+        let _enter = span.enter();
 
-        info!(ctx:serde = ctx; "received packet {:?}", pkt);
+        info!("received packet {:?}", pkt);
 
         match self.state {
             TcpState::Listen | TcpState::SynReceived => todo!("listen"),
             TcpState::SynSent => {
                 if !pkt.ack() {
-                    error!(ctx:serde = ctx; "don't know how to handle packet without ACK bit");
+                    error!("don't know how to handle packet without ACK bit");
                     return;
                 }
 
                 if pkt.rst() {
-                    info!(ctx:serde = ctx; "received RST, closing");
-                    self.set_state(&ctx, TcpState::Closed);
+                    info!("received RST, closing");
+                    self.set_state(TcpState::Closed);
 
                     return;
                 }
 
                 if pkt.acknowledgment_number() != self.send_next {
-                    error!(ctx:serde = ctx; "invalid ACK, sending RST");
+                    error!("invalid ACK, sending RST");
 
                     let mut header = self.header.clone();
                     header.syn = false;
@@ -313,14 +313,14 @@ impl TcpSocket {
                     header.rst = true;
                     header.sequence_number = pkt.acknowledgment_number();
 
-                    self.set_state(&ctx, TcpState::CloseWait);
+                    self.set_state(TcpState::CloseWait);
                     self.transmit_payload(header, &[]).unwrap();
 
                     return;
                 }
 
                 if pkt.syn() {
-                    info!(ctx:serde = ctx; "received SYN-ACK");
+                    info!("received SYN-ACK");
 
                     self.recv_next = pkt.sequence_number().wrapping_add(1);
                     self.send_unack = pkt.acknowledgment_number();
@@ -335,9 +335,9 @@ impl TcpSocket {
                         .reserve_exact(self.header.window_size as usize);
                     self.send_window.resize(self.header.window_size as usize, 0);
 
-                    self.on_rtt_measurement(&ctx, pkt.acknowledgment_number());
+                    self.on_rtt_measurement(pkt.acknowledgment_number());
 
-                    self.set_state(&ctx, TcpState::Established);
+                    self.set_state(TcpState::Established);
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
                 }
             }
@@ -357,7 +357,7 @@ impl TcpSocket {
                     || (self.recv_next <= seq_with_len && seq_with_len < recv_seq_with_len))
                 {
                     if !pkt.rst() {
-                        warn!(ctx:serde = ctx; "received unacceptable segment, sending duplicate ACK");
+                        warn!("received unacceptable segment, sending duplicate ACK");
 
                         let mut header = self.header.clone();
                         header.sequence_number = self.send_next;
@@ -365,7 +365,7 @@ impl TcpSocket {
                         header.ack = true;
                         self.transmit_payload(header, &[]).unwrap();
                     } else {
-                        warn!(ctx:serde = ctx; "received unacceptable segment with RST, dropping");
+                        warn!("received unacceptable segment with RST, dropping");
                     }
 
                     return;
@@ -373,10 +373,10 @@ impl TcpSocket {
 
                 if pkt.rst() {
                     if pkt.sequence_number() == self.recv_next {
-                        debug!(ctx:serde = ctx; "received RST, closing");
-                        self.set_state(&ctx, TcpState::Closed);
+                        debug!("received RST, closing");
+                        self.set_state(TcpState::Closed);
                     } else {
-                        warn!(ctx:serde = ctx; "received RST with wrong seq, sending challenge ACK");
+                        warn!("received RST with wrong seq, sending challenge ACK");
                         // challenge ACK (RFC 5961)
                         let mut header = self.header.clone();
                         header.sequence_number = self.send_next;
@@ -393,15 +393,15 @@ impl TcpSocket {
                 }
 
                 if !pkt.ack() {
-                    warn!(ctx:serde = ctx; "received segment without ACK, dropping");
+                    warn!("received segment without ACK, dropping");
                     return;
                 }
 
                 if self.send_unack < pkt.acknowledgment_number()
                     && pkt.acknowledgment_number() <= self.send_next
                 {
-                    self.on_rtt_measurement(&ctx, pkt.acknowledgment_number());
-                    debug!(ctx:serde = ctx; "advancing SND.UNA");
+                    self.on_rtt_measurement(pkt.acknowledgment_number());
+                    debug!("advancing SND.UNA");
                     self.send_unack = pkt.acknowledgment_number();
                 }
 
@@ -412,19 +412,19 @@ impl TcpSocket {
                 };
 
                 if fin_acked {
-                    debug!(ctx:serde = ctx; "FIN is acked");
+                    debug!("FIN is acked");
 
                     match self.state {
-                        TcpState::FinWait1 => self.set_state(&ctx, TcpState::FinWait2),
+                        TcpState::FinWait1 => self.set_state(TcpState::FinWait2),
                         TcpState::FinWait2 => {}
-                        TcpState::Closing => self.set_state(&ctx, TcpState::TimeWait),
+                        TcpState::Closing => self.set_state(TcpState::TimeWait),
                         TcpState::LastAck => {
-                            self.set_state(&ctx, TcpState::Closed);
+                            self.set_state(TcpState::Closed);
                             return;
                         }
                         TcpState::TimeWait => {
                             // TODO restart 2MSL
-                            debug!(ctx:serde = ctx; "restarting 2MSL");
+                            debug!("restarting 2MSL");
                             let mut header = self.header.clone();
                             header.acknowledgment_number = pkt.sequence_number();
                             header.ack = true;
@@ -440,7 +440,7 @@ impl TcpSocket {
                         self.state
                     {
                         if pkt.sequence_number() == self.recv_next {
-                            debug!(ctx:serde = ctx; "received in-order segment");
+                            debug!("received in-order segment");
 
                             self.recv_window.extend_from_slice(pkt.payload());
                             self.recv_next =
@@ -452,7 +452,7 @@ impl TcpSocket {
                             }
                             self.partial_segments.retain(|k, _| *k > self.recv_next);
                         } else {
-                            debug!(ctx:serde = ctx; "received out-of-order segment");
+                            debug!("received out-of-order segment");
 
                             // out-of-order segment, send an ACK for our current state (RFC5581)
                             self.partial_segments
@@ -469,7 +469,7 @@ impl TcpSocket {
                 }
 
                 if pkt.fin() && pkt.sequence_number() == self.recv_next {
-                    debug!(ctx:serde = ctx; "received FIN, ACKing");
+                    debug!("received FIN, ACKing");
 
                     // TODO if remote FIN is re-transmitted, this will never run?
                     self.recv_next += 1;
@@ -480,13 +480,13 @@ impl TcpSocket {
                     self.transmit_payload(header, &[]).unwrap();
 
                     match self.state {
-                        TcpState::Established => self.set_state(&ctx, TcpState::CloseWait),
+                        TcpState::Established => self.set_state(TcpState::CloseWait),
                         TcpState::FinWait1 => {
                             if fin_acked {
-                                self.set_state(&ctx, TcpState::TimeWait)
+                                self.set_state(TcpState::TimeWait)
                             }
                         }
-                        TcpState::FinWait2 => self.set_state(&ctx, TcpState::TimeWait),
+                        TcpState::FinWait2 => self.set_state(TcpState::TimeWait),
                         TcpState::TimeWait => {
                             // TODO restart 2MSL timeout
                         }
@@ -498,7 +498,7 @@ impl TcpSocket {
             }
             TcpState::Closed => {
                 if !pkt.rst() {
-                    warn!(ctx:serde = ctx; "received non-RST packet, sending RST");
+                    warn!("received non-RST packet, sending RST");
 
                     let mut header = self.header.clone();
                     header.rst = true;
@@ -513,7 +513,7 @@ impl TcpSocket {
 
                     self.transmit_payload(header, &[]).unwrap();
                 } else {
-                    info!(ctx:serde = ctx; "received RST packet, ignoring");
+                    info!("received RST packet, ignoring");
                 }
             }
         };
@@ -588,7 +588,8 @@ impl TcpSocket {
     }
 
     pub fn close(&mut self) {
-        let ctx = self.get_context(None);
+        let span = self.get_span(None);
+        let _enter = span.enter();
 
         match self.state {
             TcpState::Closed => {}
@@ -597,11 +598,11 @@ impl TcpSocket {
             }
             TcpState::Established => {
                 // TODO send FIN
-                self.set_state(&ctx, TcpState::FinWait1);
+                self.set_state(TcpState::FinWait1);
             }
             TcpState::CloseWait => {
                 // TODO send FIN
-                self.set_state(&ctx, TcpState::LastAck);
+                self.set_state(TcpState::LastAck);
             }
             _ => {}
         }
