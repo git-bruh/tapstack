@@ -12,8 +12,6 @@ fn main() {
 
     let dev = Arc::new(TunDevice::new("tun0").unwrap());
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
     let reader_handle = {
         let dev = Arc::clone(&dev);
         std::thread::spawn(move || dev.read_packets().unwrap())
@@ -27,6 +25,7 @@ fn main() {
     let mut buf = [0; 4096];
     let n = socket.read(&mut buf).unwrap();
     eprintln!("=== Response {}", std::str::from_utf8(&buf[0..n]).unwrap());
+    socket.close();
 
     reader_handle.join().expect("failed to join thread");
 }

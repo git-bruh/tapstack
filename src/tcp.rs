@@ -46,6 +46,7 @@ pub struct TcpSocket {
     tx: mpsc::Sender<Vec<u8>>,
     partial_segments: BTreeMap<u32, Vec<u8>>,
     timers: BTreeMap<u32, (bool, std::time::Instant)>,
+    time_wait_instant: Option<std::time::Instant>,
 }
 
 pub struct TcpSocketWrapper {
@@ -68,6 +69,10 @@ impl TcpSocketWrapper {
         while !matches!(socket.state, TcpState::Established) {
             socket = self.state_condvar.wait(socket).unwrap();
         }
+    }
+
+    pub fn close(&self) {
+        self.socket.lock().unwrap().close();
     }
 }
 
@@ -151,6 +156,7 @@ impl TcpSocket {
             tx,
             partial_segments: BTreeMap::new(),
             timers: BTreeMap::new(),
+            time_wait_instant: None,
         }
     }
 
@@ -184,6 +190,11 @@ impl TcpSocket {
     fn set_state(&mut self, state: TcpState) {
         info!("transitioned to {state:?}");
 
+        match state {
+            TcpState::TimeWait => self.time_wait_instant = Some(std::time::Instant::now()),
+            _ => {}
+        };
+
         self.state = state;
         self.state_condvar.notify_all();
     }
@@ -214,7 +225,8 @@ impl TcpSocket {
         self.rto = (self.srtt + (4.0 * self.rttvar).max(0.01)).max(1.0);
     }
 
-    pub fn tick(&mut self) {
+    /// returns whether the socket can be cleaned up
+    pub fn tick(&mut self) -> bool {
         let span = self.get_span(None);
         let _enter = span.enter();
 
@@ -238,7 +250,7 @@ impl TcpSocket {
 
                 if seq == self.syn_seq {
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
-                    return;
+                    return false;
                 }
 
                 let mut header = self.header.clone();
@@ -247,7 +259,7 @@ impl TcpSocket {
                 if let Some(fin_seq) = self.fin_seq {
                     if seq == fin_seq {
                         self.transmit_payload(self.header.clone(), &[]).unwrap();
-                        return;
+                        return false;
                     }
                 }
 
@@ -280,7 +292,19 @@ impl TcpSocket {
                 self.fin_seq = Some(self.header.sequence_number);
                 self.transmit_payload(self.header.clone(), &[]).unwrap();
             }
+        } else if let Some(time_wait_instant) = self.time_wait_instant {
+            // we take MSL as 30s
+            if std::time::Instant::now()
+                .duration_since(time_wait_instant)
+                .as_secs()
+                > 60
+            {
+                info!("reached 2MSL, cleaning up");
+                return true;
+            }
         }
+
+        return false;
     }
 
     pub fn on_packet(&mut self, pkt: etherparse::TcpSlice) {
@@ -423,8 +447,7 @@ impl TcpSocket {
                             return;
                         }
                         TcpState::TimeWait => {
-                            // TODO restart 2MSL
-                            debug!("restarting 2MSL");
+                            self.set_state(TcpState::TimeWait);
                             let mut header = self.header.clone();
                             header.acknowledgment_number = pkt.sequence_number();
                             header.ack = true;
@@ -487,9 +510,7 @@ impl TcpSocket {
                             }
                         }
                         TcpState::FinWait2 => self.set_state(TcpState::TimeWait),
-                        TcpState::TimeWait => {
-                            // TODO restart 2MSL timeout
-                        }
+                        TcpState::TimeWait => self.set_state(TcpState::TimeWait),
                         _ => {}
                     }
                 }
@@ -521,12 +542,17 @@ impl TcpSocket {
 
     pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match &self.state {
-            TcpState::Established | TcpState::FinWait1 => {}
+            TcpState::Established
+            | TcpState::FinWait1
+            | TcpState::FinWait2
+            | TcpState::CloseWait => {}
             state => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    format!("can't read in state {state:?}"),
-                ))
+                if self.recv_window.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        format!("can't read in state {state:?}"),
+                    ));
+                }
             }
         }
 

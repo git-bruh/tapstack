@@ -151,11 +151,11 @@ impl TunDevice {
                 10,
             )? == 0
             {
+                // remove sockets that have passed 2MSL after reacing TIME-WAIT state
                 self.quad_to_socket
                     .lock()
                     .unwrap()
-                    .values()
-                    .for_each(|socket| socket.lock().unwrap().tick());
+                    .retain(|_, socket| !socket.lock().unwrap().tick());
                 continue;
             }
 
@@ -191,6 +191,9 @@ impl TunDevice {
                     }
                     protocol => error!("Unknown IP protocol: {protocol:?}"),
                 },
+                Err(etherparse::err::ipv4::HeaderSliceError::Content(
+                    etherparse::err::ipv4::HeaderError::UnexpectedVersion { .. },
+                )) => {}
                 Err(e) => error!("Invalid IP packet received: {e}"),
             }
         }
