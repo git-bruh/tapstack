@@ -201,7 +201,12 @@ impl TcpSocket {
 
     // RFC 6298
     fn on_rtt_measurement(&mut self, ack: u32) {
-        let r = if let Some((retransmitted, instant)) = self.timers.get(&ack) {
+        let r = if let Some((_, (retransmitted, instant))) = self
+            .timers
+            .iter()
+            .filter(|(seq, _)| self.send_unack <= **seq && **seq < ack)
+            .nth(0)
+        {
             if *retransmitted {
                 debug!(ack, "segment was retransmitted, not measuring RTT");
                 return;
@@ -346,6 +351,8 @@ impl TcpSocket {
                 if pkt.syn() {
                     info!("received SYN-ACK");
 
+                    self.on_rtt_measurement(pkt.acknowledgment_number());
+
                     self.recv_next = pkt.sequence_number().wrapping_add(1);
                     self.send_unack = pkt.acknowledgment_number();
 
@@ -358,8 +365,6 @@ impl TcpSocket {
                     self.send_window
                         .reserve_exact(self.header.window_size as usize);
                     self.send_window.resize(self.header.window_size as usize, 0);
-
-                    self.on_rtt_measurement(pkt.acknowledgment_number());
 
                     self.set_state(TcpState::Established);
                     self.transmit_payload(self.header.clone(), &[]).unwrap();
