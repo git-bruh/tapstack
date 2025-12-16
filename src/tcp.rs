@@ -398,7 +398,8 @@ impl TcpSocket {
                         header.ack = true;
                         self.transmit_payload(header, &[]).unwrap();
                     } else {
-                        warn!("received unacceptable segment with RST, dropping");
+                        warn!("received unacceptable segment with RST, closing");
+                        self.set_state(TcpState::Closed);
                     }
 
                     return;
