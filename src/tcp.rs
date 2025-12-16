@@ -105,8 +105,8 @@ impl Read for &TcpSocketWrapper {
         let mut socket = self.socket.lock().unwrap();
 
         loop {
-            let size = socket.read(buf)?;
-            if size > 0 {
+            let (size, can_have_more) = socket.read(buf)?;
+            if size > 0 || !can_have_more {
                 return Ok(size);
             }
 
@@ -549,30 +549,27 @@ impl TcpSocket {
         };
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match &self.state {
-            TcpState::Established
-            | TcpState::FinWait1
-            | TcpState::FinWait2
-            | TcpState::CloseWait => {}
-            state => {
-                if self.recv_window.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        format!("can't read in state {state:?}"),
-                    ));
-                }
-            }
-        }
-
+    /// returns the number of bytes read and whether there might be more bytes in the future
+    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, bool)> {
         Ok(if self.recv_window.is_empty() {
-            0
+            (
+                0,
+                if let TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait = self.state
+                {
+                    true
+                } else {
+                    false
+                },
+            )
         } else {
             let drained = self
                 .recv_window
                 .drain(0..buf.len().min(self.recv_window.len()));
             buf[0..drained.len()].copy_from_slice(drained.as_slice());
-            drained.len()
+            (drained.len(), true)
         })
     }
 

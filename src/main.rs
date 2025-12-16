@@ -1,6 +1,6 @@
 use std::{
     io::{BufRead, BufReader, BufWriter, Write},
-    net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs},
+    net::ToSocketAddrs,
     sync::Arc,
 };
 use tapstack::tun::TunDevice;
