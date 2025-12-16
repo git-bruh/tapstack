@@ -71,12 +71,16 @@ impl TcpSocketWrapper {
         }
     }
 
+    pub fn reset(&self) {
+        self.socket.lock().unwrap().reset();
+    }
+
     pub fn close(&self) {
         self.socket.lock().unwrap().close();
     }
 }
 
-impl Write for TcpSocketWrapper {
+impl Write for &TcpSocketWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut n = 0;
         let mut socket = self.socket.lock().unwrap();
@@ -96,7 +100,7 @@ impl Write for TcpSocketWrapper {
     }
 }
 
-impl Read for TcpSocketWrapper {
+impl Read for &TcpSocketWrapper {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut socket = self.socket.lock().unwrap();
 
@@ -316,7 +320,7 @@ impl TcpSocket {
         let span = self.get_span(Some(pkt.sequence_number()));
         let _enter = span.enter();
 
-        info!("received packet {:?}", pkt);
+        //info!("received packet {:?}", pkt);
 
         match self.state {
             TcpState::Listen | TcpState::SynReceived => todo!("listen"),
@@ -616,6 +620,25 @@ impl TcpSocket {
         }
 
         Ok(available_capacity)
+    }
+
+    pub fn reset(&mut self) {
+        let span = self.get_span(None);
+        let _enter = span.enter();
+
+        match self.state {
+            TcpState::Closed => {}
+            TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
+                self.set_state(TcpState::Closed)
+            }
+            _ => {
+                let mut header = self.header.clone();
+                header.rst = true;
+                header.sequence_number = self.send_next;
+                self.transmit_payload(header, &[]).unwrap();
+                self.set_state(TcpState::Closed);
+            }
+        }
     }
 
     pub fn close(&mut self) {
