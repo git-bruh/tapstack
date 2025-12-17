@@ -3,9 +3,9 @@ use std::{
     net::ToSocketAddrs,
     sync::Arc,
 };
-use tapstack::tun::TunDevice;
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
+use tunstack::tun::TunDevice;
 
 fn resolve(url: &str) -> std::net::SocketAddrV4 {
     for addr in url.to_socket_addrs().unwrap() {
@@ -34,7 +34,7 @@ fn main() {
         let mut writer = BufWriter::new(&socket);
         let mut reader = BufReader::new(&socket);
 
-        writer.write_all(b"hello").unwrap();
+        writer.write_all(b"hello\n").unwrap();
         writer.flush().unwrap();
 
         socket.close();
